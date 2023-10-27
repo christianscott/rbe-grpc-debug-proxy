@@ -6,6 +6,7 @@ import (
 	"crypto/x509"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"os"
@@ -128,15 +129,44 @@ func (s *server) BatchReadBlobs(ctx context.Context, req *repb.BatchReadBlobsReq
 	log.Println("Called BatchReadBlobs")
 	return s.cas.BatchReadBlobs(ctx, req)
 }
-func (s *server) GetTree(*repb.GetTreeRequest, repb.ContentAddressableStorage_GetTreeServer) error {
+func (s *server) GetTree(in *repb.GetTreeRequest, stream repb.ContentAddressableStorage_GetTreeServer) error {
 	log.Println("Called GetTree")
-	return unimplemented("GetTree")
+	client, err := s.cas.GetTree(stream.Context(), in)
+	if err != nil {
+		return err
+	}
+	res, err := client.Recv()
+	if err != nil {
+		return err
+	}
+	err = stream.Send(res)
+	if err != nil {
+		return err
+	}
+	return nil
 }
 
 // Execution
-func (s *server) Execute(*repb.ExecuteRequest, repb.Execution_ExecuteServer) error {
+func (s *server) Execute(in *repb.ExecuteRequest, stream repb.Execution_ExecuteServer) error {
 	log.Println("Called Execute")
-	return unimplemented("Execute")
+	client, err := s.exec.Execute(stream.Context(), in)
+	if err != nil {
+		return err
+	}
+	for {
+		req, err := client.Recv()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return err
+		}
+		err = stream.Send(req)
+		if err != nil {
+			return err
+		}
+	}
+	return nil
 }
 func (s *server) WaitExecution(*repb.WaitExecutionRequest, repb.Execution_WaitExecutionServer) error {
 	log.Println("Called WaitExecution")
@@ -144,17 +174,62 @@ func (s *server) WaitExecution(*repb.WaitExecutionRequest, repb.Execution_WaitEx
 }
 
 // ByteStream
-func (s *server) Read(req *bytestream.ReadRequest, srv bytestream.ByteStream_ReadServer) error {
+func (s *server) Read(in *bytestream.ReadRequest, stream bytestream.ByteStream_ReadServer) error {
 	log.Println("Called Read")
-	return unimplemented("Read")
+	client, err := s.bs.Read(stream.Context(), in)
+	if err != nil {
+		return err
+	}
+	for {
+		res, err := client.Recv()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return err
+		}
+		err = stream.Send(res)
+		if err != nil {
+			return err
+		}
+	}
+	return nil
 }
-func (s *server) Write(srv bytestream.ByteStream_WriteServer) error {
+func (s *server) Write(stream bytestream.ByteStream_WriteServer) error {
 	log.Println("Called Write")
-	return unimplemented("Write")
+	client, err := s.bs.Write(stream.Context())
+	if err != nil {
+		return err
+	}
+	for {
+		req, err := stream.Recv()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			log.Printf("error receiving from stream: %v", err)
+			return err
+		}
+		err = client.Send(req)
+		if err != nil {
+			log.Printf("error sending to client: %v", err)
+			return err
+		}
+	}
+
+	res, err := client.CloseAndRecv()
+	if err != nil {
+		return err
+	}
+	err = stream.SendAndClose(res)
+	if err != nil {
+		return err
+	}
+	return nil
 }
-func (s *server) QueryWriteStatus(context.Context, *bytestream.QueryWriteStatusRequest) (*bytestream.QueryWriteStatusResponse, error) {
+func (s *server) QueryWriteStatus(ctx context.Context, req *bytestream.QueryWriteStatusRequest) (*bytestream.QueryWriteStatusResponse, error) {
 	log.Println("Called QueryWriteStatus")
-	return nil, unimplemented("QueryWriteStatus")
+	return s.bs.QueryWriteStatus(ctx, req)
 }
 
 func unimplemented(meth string) error {
