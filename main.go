@@ -27,10 +27,16 @@ func main() {
 	flag.StringVar(&caFile, "ca_cert", "", "ca file")
 	flag.StringVar(&clientCertFile, "client_cert", "", "client cert file")
 	flag.StringVar(&clientCertKeyFile, "client_cert_key", "", "client cert key file")
-	flag.StringVar(&unix, "unix", "", "unix socket")
-	flag.StringVar(&port, "port", "8080", "port")
+	flag.StringVar(&unix, "unix", "", "unix socket (optional)")
+	flag.StringVar(&port, "port", "8080", "port (optional)")
 	flag.Parse()
 
+	if target == "" || caFile == "" || clientCertFile == "" || clientCertKeyFile == "" {
+		flag.Usage()
+		os.Exit(1)
+	}
+
+	// TODO: if possible, it would be smarter to re-use the TLS config from the client rather than setting it up again here
 	tlsConf := &tls.Config{}
 	readCert, err := tls.LoadX509KeyPair(clientCertFile, clientCertKeyFile)
 	if err != nil {
@@ -69,10 +75,12 @@ func main() {
 	exec := repb.NewExecutionClient(conn)
 	bs := bytestream.NewByteStreamClient(conn)
 
+	fmt.Fprintf(os.Stderr, "checking connectivity to %s...", target)
 	_, err = caps.GetCapabilities(context.Background(), &repb.GetCapabilitiesRequest{})
 	if err != nil {
 		panic(err)
 	}
+	fmt.Fprintln(os.Stderr, " ok")
 
 	srv := &server{ac, caps, cas, exec, bs}
 	gsrv := grpc.NewServer()
@@ -148,20 +156,20 @@ func (s *server) GetTree(in *repb.GetTreeRequest, stream repb.ContentAddressable
 
 // Execution
 func (s *server) Execute(in *repb.ExecuteRequest, stream repb.Execution_ExecuteServer) error {
-	log.Println("Called Execute")
+	log.Printf("Called Execute: %s\n", in.ActionDigest.String())
 	client, err := s.exec.Execute(stream.Context(), in)
 	if err != nil {
 		return err
 	}
 	for {
-		req, err := client.Recv()
+		op, err := client.Recv()
 		if err == io.EOF {
 			break
 		}
 		if err != nil {
 			return err
 		}
-		err = stream.Send(req)
+		err = stream.Send(op)
 		if err != nil {
 			return err
 		}
@@ -175,7 +183,7 @@ func (s *server) WaitExecution(*repb.WaitExecutionRequest, repb.Execution_WaitEx
 
 // ByteStream
 func (s *server) Read(in *bytestream.ReadRequest, stream bytestream.ByteStream_ReadServer) error {
-	log.Println("Called Read")
+	log.Printf("Called Read: %s\n", in.ResourceName)
 	client, err := s.bs.Read(stream.Context(), in)
 	if err != nil {
 		return err
@@ -196,7 +204,7 @@ func (s *server) Read(in *bytestream.ReadRequest, stream bytestream.ByteStream_R
 	return nil
 }
 func (s *server) Write(stream bytestream.ByteStream_WriteServer) error {
-	log.Println("Called Write")
+	log.Printf("Called Write\n")
 	client, err := s.bs.Write(stream.Context())
 	if err != nil {
 		return err
