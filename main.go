@@ -16,10 +16,10 @@ import (
 
 	repb "github.com/bazelbuild/remote-apis/build/bazel/remote/execution/v2"
 	"google.golang.org/genproto/googleapis/bytestream"
+	bepb "google.golang.org/genproto/googleapis/devtools/build/v1"
 	"google.golang.org/grpc"
-	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials"
-	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/types/known/emptypb"
 )
 
 func main() {
@@ -77,6 +77,7 @@ func main() {
 	cas := repb.NewContentAddressableStorageClient(conn)
 	exec := repb.NewExecutionClient(conn)
 	bs := bytestream.NewByteStreamClient(conn)
+	beps := bepb.NewPublishBuildEventClient(conn)
 
 	fmt.Fprintf(os.Stderr, "checking connectivity to %s...", target)
 	_, err = caps.GetCapabilities(context.Background(), &repb.GetCapabilitiesRequest{})
@@ -85,13 +86,14 @@ func main() {
 	}
 	fmt.Fprintln(os.Stderr, " ok")
 
-	srv := &server{ac, caps, cas, exec, bs}
+	srv := &server{ac, caps, cas, exec, bs, beps}
 	gsrv := grpc.NewServer()
 	repb.RegisterActionCacheServer(gsrv, srv)
 	repb.RegisterCapabilitiesServer(gsrv, srv)
 	repb.RegisterContentAddressableStorageServer(gsrv, srv)
 	repb.RegisterExecutionServer(gsrv, srv)
 	bytestream.RegisterByteStreamServer(gsrv, srv)
+	bepb.RegisterPublishBuildEventServer(gsrv, srv)
 
 	listener, err := net.Listen("tcp", ":"+port)
 	if err != nil {
@@ -109,6 +111,7 @@ type server struct {
 	cas  repb.ContentAddressableStorageClient
 	exec repb.ExecutionClient
 	bs   bytestream.ByteStreamClient
+	beps bepb.PublishBuildEventClient
 }
 
 type invocation struct {
@@ -301,12 +304,85 @@ func (s *server) Write(stream bytestream.ByteStream_WriteServer) error {
 	}
 	return nil
 }
+
 func (s *server) QueryWriteStatus(ctx context.Context, req *bytestream.QueryWriteStatusRequest) (*bytestream.QueryWriteStatusResponse, error) {
 	i := invoke("QueryWriteStatus", req)
 	defer i.end()
 	return s.bs.QueryWriteStatus(ctx, req)
 }
 
-func unimplemented(meth string) error {
-	return status.Error(codes.Internal, fmt.Sprintf("unimplemented: %s", meth))
+// BEP
+func (s *server) PublishLifecycleEvent(ctx context.Context, req *bepb.PublishLifecycleEventRequest) (*emptypb.Empty, error) {
+	i := invoke("PublishLifecycleEvent", req)
+	defer i.end()
+	return s.beps.PublishLifecycleEvent(ctx, req)
 }
+
+func (s *server) PublishBuildToolEventStream(stream bepb.PublishBuildEvent_PublishBuildToolEventStreamServer) error {
+	i := invoke("PublishBuildToolEventStream", nil)
+	defer i.end()
+
+	client, err := s.beps.PublishBuildToolEventStream(stream.Context())
+	if err != nil {
+		return err
+	}
+
+	var clientDone = make(chan error)
+	go func() {
+		for {
+			res, err := client.Recv()
+			if err == io.EOF {
+				clientDone <- nil
+				return
+			}
+			if err != nil {
+				log.Printf("error receiving from client: %v", err)
+				clientDone <- err
+				return
+			}
+			err = stream.Send(res)
+			if err != nil {
+				log.Printf("error sending from client to server: %v", err)
+				clientDone <- err
+				return
+			}
+		}
+	}()
+
+	var serverDone = make(chan error)
+	go func() {
+		for {
+			res, err := stream.Recv()
+			if err == io.EOF {
+				serverDone <- nil
+				return
+			}
+			if err != nil {
+				log.Printf("error receiving from stream: %v", err)
+				serverDone <- err
+				return
+			}
+			err = client.Send(res)
+			if err != nil {
+				log.Printf("error sending to client: %v", err)
+				serverDone <- err
+				return
+			}
+		}
+	}()
+
+	err = <-clientDone
+	if err != nil {
+		return err
+	}
+	err = <-serverDone
+	if err != nil {
+		return err
+	}
+
+	return nil
+}
+
+// func unimplemented(meth string) error {
+// 	return status.Error(codes.Internal, fmt.Sprintf("unimplemented: %s", meth))
+// }
