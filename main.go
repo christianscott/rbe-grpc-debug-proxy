@@ -4,12 +4,15 @@ import (
 	"context"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
 	"log"
 	"net"
 	"os"
+	"sync/atomic"
+	"time"
 
 	repb "github.com/bazelbuild/remote-apis/build/bazel/remote/execution/v2"
 	"google.golang.org/genproto/googleapis/bytestream"
@@ -108,37 +111,79 @@ type server struct {
 	bs   bytestream.ByteStreamClient
 }
 
+type invocation struct {
+	method    string
+	req       any
+	startedAt time.Time
+	encoder   *json.Encoder
+	id        int64
+}
+
+var nextInvocationId atomic.Int64 = atomic.Int64{}
+
+func invoke(method string, req any) *invocation {
+	inv := &invocation{method: method, req: req, id: nextInvocationId.Add(1), encoder: json.NewEncoder(os.Stdout)}
+	inv.start()
+	return inv
+}
+
+func (i *invocation) start() {
+	i.startedAt = time.Now()
+	i.encoder.Encode(map[string]interface{}{
+		"method": i.method,
+		"type":   "start",
+		"req":    i.req,
+		"id":     i.id,
+	})
+}
+
+func (i *invocation) end() {
+	i.encoder.Encode(map[string]interface{}{
+		"method":  i.method,
+		"type":    "end",
+		"id":      i.id,
+		"elapsed": time.Since(i.startedAt).Milliseconds(),
+	})
+}
+
 // Capabilities
 func (s *server) GetCapabilities(ctx context.Context, req *repb.GetCapabilitiesRequest) (*repb.ServerCapabilities, error) {
-	log.Println("Called GetCapabilities")
+	i := invoke("GetCapabilities", req)
+	defer i.end()
 	return s.caps.GetCapabilities(ctx, req)
 }
 
 // ActionCache
 func (s *server) GetActionResult(ctx context.Context, req *repb.GetActionResultRequest) (*repb.ActionResult, error) {
-	log.Println("Called GetActionResult")
+	i := invoke("GetActionResult", req)
+	defer i.end()
 	return s.ac.GetActionResult(ctx, req)
 }
 func (s *server) UpdateActionResult(ctx context.Context, req *repb.UpdateActionResultRequest) (*repb.ActionResult, error) {
-	log.Println("Called UpdateActionResult")
+	i := invoke("UpdateActionResult", req)
+	defer i.end()
 	return s.ac.UpdateActionResult(ctx, req)
 }
 
 // ContentAddressableStorage
 func (s *server) FindMissingBlobs(ctx context.Context, req *repb.FindMissingBlobsRequest) (*repb.FindMissingBlobsResponse, error) {
-	log.Println("Called FindMissingBlobs")
+	i := invoke("FindMissingBlobs", req)
+	defer i.end()
 	return s.cas.FindMissingBlobs(ctx, req)
 }
 func (s *server) BatchUpdateBlobs(ctx context.Context, req *repb.BatchUpdateBlobsRequest) (*repb.BatchUpdateBlobsResponse, error) {
-	log.Println("Called BatchUpdateBlobs")
+	i := invoke("FindMissingBlobs", req)
+	defer i.end()
 	return s.cas.BatchUpdateBlobs(ctx, req)
 }
 func (s *server) BatchReadBlobs(ctx context.Context, req *repb.BatchReadBlobsRequest) (*repb.BatchReadBlobsResponse, error) {
-	log.Println("Called BatchReadBlobs")
+	i := invoke("FindMissingBlobs", req)
+	defer i.end()
 	return s.cas.BatchReadBlobs(ctx, req)
 }
 func (s *server) GetTree(in *repb.GetTreeRequest, stream repb.ContentAddressableStorage_GetTreeServer) error {
-	log.Println("Called GetTree")
+	i := invoke("FindMissingBlobs", nil)
+	defer i.end()
 	client, err := s.cas.GetTree(stream.Context(), in)
 	if err != nil {
 		return err
@@ -156,7 +201,8 @@ func (s *server) GetTree(in *repb.GetTreeRequest, stream repb.ContentAddressable
 
 // Execution
 func (s *server) Execute(in *repb.ExecuteRequest, stream repb.Execution_ExecuteServer) error {
-	log.Printf("Called Execute: %s\n", in.ActionDigest.String())
+	i := invoke("Execute", in)
+	defer i.end()
 	client, err := s.exec.Execute(stream.Context(), in)
 	if err != nil {
 		return err
@@ -176,14 +222,33 @@ func (s *server) Execute(in *repb.ExecuteRequest, stream repb.Execution_ExecuteS
 	}
 	return nil
 }
-func (s *server) WaitExecution(*repb.WaitExecutionRequest, repb.Execution_WaitExecutionServer) error {
-	log.Println("Called WaitExecution")
-	return unimplemented("WaitExecution")
+func (s *server) WaitExecution(req *repb.WaitExecutionRequest, stream repb.Execution_WaitExecutionServer) error {
+	i := invoke("WaitExecution", req)
+	defer i.end()
+	client, err := s.exec.WaitExecution(stream.Context(), req)
+	if err != nil {
+		return err
+	}
+	for {
+		op, err := client.Recv()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return err
+		}
+		err = stream.Send(op)
+		if err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // ByteStream
 func (s *server) Read(in *bytestream.ReadRequest, stream bytestream.ByteStream_ReadServer) error {
-	log.Printf("Called Read: %s\n", in.ResourceName)
+	i := invoke("Read", in)
+	defer i.end()
 	client, err := s.bs.Read(stream.Context(), in)
 	if err != nil {
 		return err
@@ -204,7 +269,8 @@ func (s *server) Read(in *bytestream.ReadRequest, stream bytestream.ByteStream_R
 	return nil
 }
 func (s *server) Write(stream bytestream.ByteStream_WriteServer) error {
-	log.Printf("Called Write\n")
+	i := invoke("Write", nil)
+	defer i.end()
 	client, err := s.bs.Write(stream.Context())
 	if err != nil {
 		return err
@@ -236,7 +302,8 @@ func (s *server) Write(stream bytestream.ByteStream_WriteServer) error {
 	return nil
 }
 func (s *server) QueryWriteStatus(ctx context.Context, req *bytestream.QueryWriteStatusRequest) (*bytestream.QueryWriteStatusResponse, error) {
-	log.Println("Called QueryWriteStatus")
+	i := invoke("QueryWriteStatus", req)
+	defer i.end()
 	return s.bs.QueryWriteStatus(ctx, req)
 }
 
