@@ -39,7 +39,6 @@ func main() {
 		os.Exit(1)
 	}
 
-	// TODO: if possible, it would be smarter to re-use the TLS config from the client rather than setting it up again here
 	tlsConf := &tls.Config{}
 	readCert, err := tls.LoadX509KeyPair(clientCertFile, clientCertKeyFile)
 	if err != nil {
