@@ -15,10 +15,13 @@ import (
 	"time"
 
 	repb "github.com/bazelbuild/remote-apis/build/bazel/remote/execution/v2"
+	lru "github.com/hashicorp/golang-lru/v2"
 	"google.golang.org/genproto/googleapis/bytestream"
 	bepb "google.golang.org/genproto/googleapis/devtools/build/v1"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
+	"google.golang.org/grpc/metadata"
+	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/emptypb"
 )
 
@@ -85,7 +88,19 @@ func main() {
 	}
 	fmt.Fprintln(os.Stderr, " ok")
 
-	srv := &server{ac, caps, cas, exec, bs, beps}
+	cachingAC, err := newCachingActionClient(ac)
+	if err != nil {
+		panic(err)
+	}
+
+	srv := &server{
+		ac:   cachingAC,
+		caps: caps,
+		cas:  cas,
+		exec: exec,
+		bs:   bs,
+		beps: beps,
+	}
 	gsrv := grpc.NewServer()
 	repb.RegisterActionCacheServer(gsrv, srv)
 	repb.RegisterCapabilitiesServer(gsrv, srv)
@@ -104,8 +119,50 @@ func main() {
 	}
 }
 
+type cachingActionCacheClient struct {
+	cache  *lru.Cache[string, *repb.ActionResult]
+	client repb.ActionCacheClient
+}
+
+func newCachingActionClient(ac repb.ActionCacheClient) (*cachingActionCacheClient, error) {
+	cache, err := lru.New[string, *repb.ActionResult](100_000)
+	if err != nil {
+		return nil, err
+	}
+	return &cachingActionCacheClient{
+		cache:  cache,
+		client: ac,
+	}, nil
+}
+
+func (c *cachingActionCacheClient) GetActionResult(ctx context.Context, req *repb.GetActionResultRequest) (*repb.ActionResult, error) {
+	key := fmt.Sprintf("%s:%s", req.InstanceName, req.ActionDigest.Hash)
+	cached, ok := c.cache.Get(key)
+	if ok {
+		return cached, nil
+	}
+	res, err := c.client.GetActionResult(ctx, req)
+	if err != nil {
+		return nil, err
+	}
+	if res == nil {
+		return nil, nil
+	}
+
+	clone := proto.Clone(res).(*repb.ActionResult)
+	c.cache.Add(key, clone)
+	return res, nil
+}
+
+func (c *cachingActionCacheClient) UpdateActionResult(ctx context.Context, req *repb.UpdateActionResultRequest) (*repb.ActionResult, error) {
+	key := fmt.Sprintf("%s:%s", req.InstanceName, req.ActionDigest.Hash)
+	clone := proto.Clone(req.ActionResult).(*repb.ActionResult)
+	c.cache.Add(key, clone)
+	return c.client.UpdateActionResult(ctx, req)
+}
+
 type server struct {
-	ac   repb.ActionCacheClient
+	ac   *cachingActionCacheClient
 	caps repb.CapabilitiesClient
 	cas  repb.ContentAddressableStorageClient
 	exec repb.ExecutionClient
@@ -119,14 +176,36 @@ type invocation struct {
 	startedAt time.Time
 	encoder   *json.Encoder
 	id        int64
+	rmd       *repb.RequestMetadata
 }
 
 var nextInvocationId atomic.Int64 = atomic.Int64{}
 
-func invoke(method string, req any) *invocation {
-	inv := &invocation{method: method, req: req, id: nextInvocationId.Add(1), encoder: json.NewEncoder(os.Stdout)}
+func invoke(method string, ctx context.Context, req any) *invocation {
+	rmd := requestMetadataFromContext(ctx)
+	inv := &invocation{method: method, req: req, rmd: rmd, id: nextInvocationId.Add(1), encoder: json.NewEncoder(io.Discard)}
 	inv.start()
 	return inv
+}
+
+func requestMetadataFromContext(ctx context.Context) *repb.RequestMetadata {
+	md, ok := metadata.FromIncomingContext(ctx)
+	if !ok {
+		return nil
+	}
+
+	values := md.Get("build.bazel.remote.execution.v2.requestmetadata-bin")
+	if len(values) != 1 {
+		return nil
+	}
+
+	rmd := &repb.RequestMetadata{}
+	err := proto.Unmarshal([]byte(values[0]), rmd)
+	if err != nil {
+		return nil
+	}
+
+	return rmd
 }
 
 func (i *invocation) start() {
@@ -150,36 +229,36 @@ func (i *invocation) end() {
 
 // Capabilities
 func (s *server) GetCapabilities(ctx context.Context, req *repb.GetCapabilitiesRequest) (*repb.ServerCapabilities, error) {
-	i := invoke("GetCapabilities", req)
+	i := invoke("GetCapabilities", ctx, req)
 	defer i.end()
 	return s.caps.GetCapabilities(ctx, req)
 }
 
 // ActionCache
 func (s *server) GetActionResult(ctx context.Context, req *repb.GetActionResultRequest) (*repb.ActionResult, error) {
-	i := invoke("GetActionResult", req)
+	i := invoke("GetActionResult", ctx, req)
 	defer i.end()
 	return s.ac.GetActionResult(ctx, req)
 }
 func (s *server) UpdateActionResult(ctx context.Context, req *repb.UpdateActionResultRequest) (*repb.ActionResult, error) {
-	i := invoke("UpdateActionResult", req)
+	i := invoke("UpdateActionResult", ctx, req)
 	defer i.end()
 	return s.ac.UpdateActionResult(ctx, req)
 }
 
 // ContentAddressableStorage
 func (s *server) FindMissingBlobs(ctx context.Context, req *repb.FindMissingBlobsRequest) (*repb.FindMissingBlobsResponse, error) {
-	i := invoke("FindMissingBlobs", req)
+	i := invoke("FindMissingBlobs", ctx, req)
 	defer i.end()
 	return s.cas.FindMissingBlobs(ctx, req)
 }
 func (s *server) BatchUpdateBlobs(ctx context.Context, req *repb.BatchUpdateBlobsRequest) (*repb.BatchUpdateBlobsResponse, error) {
-	i := invoke("FindMissingBlobs", req)
+	i := invoke("FindMissingBlobs", ctx, req)
 	defer i.end()
 	return s.cas.BatchUpdateBlobs(ctx, req)
 }
 func (s *server) BatchReadBlobs(ctx context.Context, req *repb.BatchReadBlobsRequest) (*repb.BatchReadBlobsResponse, error) {
-	i := invoke("FindMissingBlobs", req)
+	i := invoke("FindMissingBlobs", ctx, req)
 	defer i.end()
 	return s.cas.BatchReadBlobs(ctx, req)
 }
@@ -225,7 +304,7 @@ func (s *server) Execute(in *repb.ExecuteRequest, stream repb.Execution_ExecuteS
 	return nil
 }
 func (s *server) WaitExecution(req *repb.WaitExecutionRequest, stream repb.Execution_WaitExecutionServer) error {
-	i := invoke("WaitExecution", req)
+	i := invoke("WaitExecution", ctx, req)
 	defer i.end()
 	client, err := s.exec.WaitExecution(stream.Context(), req)
 	if err != nil {
@@ -305,14 +384,14 @@ func (s *server) Write(stream bytestream.ByteStream_WriteServer) error {
 }
 
 func (s *server) QueryWriteStatus(ctx context.Context, req *bytestream.QueryWriteStatusRequest) (*bytestream.QueryWriteStatusResponse, error) {
-	i := invoke("QueryWriteStatus", req)
+	i := invoke("QueryWriteStatus", ctx, req)
 	defer i.end()
 	return s.bs.QueryWriteStatus(ctx, req)
 }
 
 // BEP
 func (s *server) PublishLifecycleEvent(ctx context.Context, req *bepb.PublishLifecycleEventRequest) (*emptypb.Empty, error) {
-	i := invoke("PublishLifecycleEvent", req)
+	i := invoke("PublishLifecycleEvent", ctx, req)
 	defer i.end()
 	return s.beps.PublishLifecycleEvent(ctx, req)
 }
