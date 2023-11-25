@@ -4,6 +4,7 @@ go 1.19
 
 require (
 	github.com/bazelbuild/remote-apis v0.0.0-20230822133051-6c32c3b917cc
+	github.com/hashicorp/golang-lru/v2 v2.0.7
 	google.golang.org/genproto v0.0.0-20231106174013-bbf56f31fb17
 	google.golang.org/genproto/googleapis/bytestream v0.0.0-20231016165738-49dd2c1f3d0b
 	google.golang.org/grpc v1.59.0
